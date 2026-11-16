@@ -18,6 +18,8 @@ const { execFileSync, execSync } = require('child_process');
 const { signRelease, verifyRelease, sha256hex } = require('../release-sign');
 
 const ROOT = path.join(__dirname, '..');
+const SYSTEM_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const TAR = process.platform === 'win32' && fs.existsSync(SYSTEM_TAR) ? SYSTEM_TAR : 'tar';
 const FILES = ['jam-relay.js', 'updater.js', 'release-sign.js', 'package.json', 'package-lock.json', 'release-key.pub.pem', 'LICENSE', 'README.md', 'windows'];
 
 function copy(src, dst) {
@@ -50,7 +52,7 @@ function buildRelease({ key, outDir, srcDir = ROOT, version, patch, modulesFrom 
     const zipPath = path.join(outDir, `jam-relay-${ver}.zip`);
     fs.rmSync(zipPath, { force: true });
     // Windows 10+ 의 tar(bsdtar) 는 확장자가 .zip 이면 zip 으로 만든다
-    execFileSync('tar', ['-a', '-cf', zipPath, '-C', staging, '.'], { windowsHide: true, stdio: 'ignore' });
+    execFileSync(TAR, ['-a', '-cf', zipPath, '-C', staging, '.'], { windowsHide: true, stdio: 'ignore' });
     const zip = fs.readFileSync(zipPath);
     const sig = signRelease(key, ver, zip);
     fs.writeFileSync(`${zipPath}.sig`, sig + '\n');

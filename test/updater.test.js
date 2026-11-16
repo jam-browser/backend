@@ -12,6 +12,8 @@ const WebSocket = require('ws');
 const { buildRelease } = require('../tools/make-release');
 
 const ROOT = path.join(__dirname, '..');
+const SYSTEM_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const TAR = process.platform === 'win32' && fs.existsSync(SYSTEM_TAR) ? SYSTEM_TAR : 'tar';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function keypair() {
@@ -61,7 +63,7 @@ function getVersion(port) {
   // --- 1.0.0 설치된 상태 만들기
   const r100 = build('1.0.0');
   fs.mkdirSync(path.join(HOME, 'versions', '1.0.0'), { recursive: true });
-  execFileSync('tar', ['-xf', r100.zipPath, '-C', path.join(HOME, 'versions', '1.0.0')]);
+  execFileSync(TAR, ['-xf', r100.zipPath, '-C', path.join(HOME, 'versions', '1.0.0')]);
   fs.writeFileSync(path.join(HOME, 'current.txt'), '1.0.0');
   const relayPort = await freePort();
   fs.writeFileSync(path.join(HOME, 'config.json'), JSON.stringify({ repo: 'test/backend', port: relayPort, verifySeconds: 40 }));

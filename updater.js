@@ -22,6 +22,9 @@ const { spawn, execFileSync } = require('child_process');
 const { verifyRelease } = require('./release-sign');
 
 const SELF_VERSION = require('./package.json').version;
+// zip 을 풀 수 있는 Windows 기본 tar 를 쓴다 (PATH 에 zip 을 못 푸는 다른 tar 가 먼저 있어도 괜찮게)
+const SYSTEM_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const TAR = process.platform === 'win32' && fs.existsSync(SYSTEM_TAR) ? SYSTEM_TAR : 'tar';
 
 // ---------- 인자 · 설정 ----------
 function parseArgs(argv) {
@@ -253,7 +256,7 @@ async function main() {
   const zipFile = path.join(HOME, `${zipName}.download`);
   fs.writeFileSync(zipFile, zip);
   try {
-    execFileSync('tar', ['-xf', zipFile, '-C', tmp], { windowsHide: true, stdio: 'ignore' });
+    execFileSync(TAR, ['-xf', zipFile, '-C', tmp], { windowsHide: true, stdio: 'ignore' });
   } finally {
     fs.rmSync(zipFile, { force: true });
   }
