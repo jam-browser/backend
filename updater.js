@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Jam 중계 서버 자동 업데이트 (Windows 작업 스케줄러가 6시간마다 실행)
+ * Jam 중계 서버 자동 업데이트 (Windows 작업 스케줄러가 5분마다 실행, 설치 때 -UpdateEveryMinutes 로 바꿀 수 있음)
  *
  *   node versions\<현재버전>\updater.js --home C:\JamRelay
  *

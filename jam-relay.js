@@ -302,7 +302,7 @@ function loadSettings(args) {
 // 자동 업데이트: current.txt 가 다른 버전을 가리키면, 진행 중인 Jam 이 없을 때 종료 → run-relay.cmd 가 새 버전으로 다시 켠다
 function watchForUpdate(home, relay, log) {
   const file = path.join(home, 'current.txt');
-  const MAX_WAIT = 6 * 60 * 60e3; // 6시간 넘게 계속 바쁘면 그냥 교체 (호스트 앱은 자동으로 다시 연결)
+  const MAX_WAIT = 6 * 60 * 60e3; // 새 버전이 나온 뒤 6시간 넘게 계속 바쁘면 그냥 교체 (호스트 앱은 자동으로 다시 연결)
   let since = null;
   setInterval(() => {
     let want;

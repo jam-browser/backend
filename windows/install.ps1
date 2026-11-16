@@ -1,20 +1,21 @@
 # Jam relay - install as an always-on Windows service-like setup with automatic updates.
 # Run from an extracted release (or a checkout) in an Administrator PowerShell:
 #   powershell -ExecutionPolicy Bypass -File windows\install.ps1 [-InstallDir C:\JamRelay] [-Port 3031]
-#        [-Pfx C:\certs\relay.pfx -PfxPass secret] [-NoAutoUpdate]
+#        [-Pfx C:\certs\relay.pfx -PfxPass secret] [-NoAutoUpdate] [-UpdateEveryMinutes 5]
 #
 # Result:
 #   C:\JamRelay\versions\<version>\   program files (one folder per version, previous kept for rollback)
 #   C:\JamRelay\current.txt           version that should run
 #   C:\JamRelay\config.json           port / certificate / auto-update settings
 #   Task "Jam Relay"          starts at boot, keeps the relay running (LOCAL SERVICE account)
-#   Task "Jam Relay Updater"  checks GitHub releases every 6 hours, installs only correctly signed versions
+#   Task "Jam Relay Updater"  checks GitHub releases every 5 minutes (-UpdateEveryMinutes), installs only correctly signed versions
 param(
   [string]$InstallDir = "C:\JamRelay",
   [int]$Port = 3031,
   [string]$Pfx = "",
   [string]$PfxPass = "",
-  [switch]$NoAutoUpdate
+  [switch]$NoAutoUpdate,
+  [ValidateRange(5, 1440)][int]$UpdateEveryMinutes = 5
 )
 $ErrorActionPreference = "Stop"
 
@@ -65,11 +66,11 @@ $relayAction = New-ScheduledTaskAction -Execute (Join-Path $InstallDir "run-rela
 Register-ScheduledTask -TaskName "Jam Relay" -Action $relayAction -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $runSettings -Force | Out-Null
 
 $updAction = New-ScheduledTaskAction -Execute (Join-Path $InstallDir "run-updater.cmd") -WorkingDirectory $InstallDir
-$every6h = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Hours 6)
+$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes $UpdateEveryMinutes)
 $boot = New-ScheduledTaskTrigger -AtStartup
-$boot.Delay = "PT10M"
+$boot.Delay = "PT2M"
 $updSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName "Jam Relay Updater" -Action $updAction -Trigger @($every6h, $boot) -Principal $principal -Settings $updSettings -Force | Out-Null
+Register-ScheduledTask -TaskName "Jam Relay Updater" -Action $updAction -Trigger @($repeat, $boot) -Principal $principal -Settings $updSettings -Force | Out-Null
 if ($NoAutoUpdate) { Disable-ScheduledTask -TaskName "Jam Relay Updater" | Out-Null }
 
 Stop-ScheduledTask -TaskName "Jam Relay" -ErrorAction SilentlyContinue
@@ -83,4 +84,4 @@ Write-Host "Done. Jam relay is running: $v" -ForegroundColor Green
 Write-Host "  Port to forward / open : TCP $Port"
 Write-Host "  Address for the app    : <this server's public IP or domain>:$Port"
 Write-Host "  Logs                   : $InstallDir\logs"
-Write-Host "  Auto update            : $(if ($NoAutoUpdate) { 'off' } else { 'every 6 hours, signed releases only' })"
+Write-Host "  Auto update            : $(if ($NoAutoUpdate) { 'off' } else { "every $UpdateEveryMinutes minutes, signed releases only" })"

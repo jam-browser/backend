@@ -1,6 +1,6 @@
 {
   "name": "jam-relay",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Jam Browser 중계 서버 (라우팅 전용, 암호화된 데이터를 전달만 함) · 서명된 릴리스로 자동 업데이트",
   "main": "jam-relay.js",
   "private": true,

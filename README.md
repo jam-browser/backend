@@ -7,7 +7,7 @@
 - 대화는 호스트와 참여자 사이에서 초대 코드의 비밀키로 **암호화**되어 있어서 중계 서버는 내용·이름을 볼 수 없어요.
 - 아무것도 저장하지 않아요. 접속·종료 로그(시간, IP 앞부분)만 남아요.
 - 가장 싼 사양(1 vCPU / 1GB RAM)으로 충분해요.
-- **자동 업데이트**: 6시간마다 이 저장소의 릴리스를 확인하고, **배포 키로 서명된 버전만** 설치해요.
+- **자동 업데이트**: 5분마다 이 저장소의 릴리스를 확인하고, **배포 키로 서명된 버전만** 설치해요.
 
 ```
 참여자 ──인터넷──▶ 중계 서버 ──▶ 호스트 PC (Jam Browser 안의 Jam 서버)
@@ -41,10 +41,10 @@ powershell -ExecutionPolicy Bypass -File windows\install.ps1
 | `C:\JamRelay\config.json` | 포트 · 인증서 · 자동 업데이트 설정 |
 | `C:\JamRelay\logs\` | relay.log, updater.log |
 | 작업 `Jam Relay` | 부팅 때 시작, 계속 실행 (권한이 가장 낮은 LOCAL SERVICE 계정) |
-| 작업 `Jam Relay Updater` | 6시간마다 + 부팅 10분 뒤 업데이트 확인 |
+| 작업 `Jam Relay Updater` | 5분마다 + 부팅 2분 뒤 업데이트 확인 |
 | 방화벽 규칙 | `Jam Relay (TCP 3031)` |
 
-옵션: `-InstallDir D:\JamRelay` · `-Port 443` · `-Pfx C:\certs\relay.pfx -PfxPass 비밀번호` (wss) · `-NoAutoUpdate`
+옵션: `-InstallDir D:\JamRelay` · `-Port 443` · `-Pfx C:\certs\relay.pfx -PfxPass 비밀번호` (wss) · `-UpdateEveryMinutes 60` (기본 5분) · `-NoAutoUpdate`
 
 제거: `powershell -ExecutionPolicy Bypass -File windows\uninstall.ps1 [-RemoveFiles]`
 
