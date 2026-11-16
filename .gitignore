@@ -1,0 +1,6 @@
+node_modules/
+dist/
+logs/
+*.pem
+!release-key.pub.pem
+LOCAL-SETUP.md
