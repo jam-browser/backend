@@ -78,6 +78,74 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
 
   for (const w of [again, guest, accept]) w.close();
   await relay.close();
+
+  // ---------- 바이트 한도: 버리지 않고 늦춤 ----------
+  async function pair(r, ctl, route, token) {
+    const g = new WebSocket(`ws://127.0.0.1:${r.port}/join/${route}`);
+    await opened(g);
+    const inc = JSON.parse((await nextMsg(ctl)).d);
+    const acc = new WebSocket(`ws://127.0.0.1:${r.port}/accept/${route}/${inc.id}?token=${token}`);
+    await opened(acc);
+    return { g, acc };
+  }
+  const collect = (ws, count) =>
+    new Promise((resolve) => {
+      let got = 0;
+      let bytes = 0;
+      const t0 = Date.now();
+      ws.on('message', (d) => {
+        bytes += d.length;
+        if (++got === count) resolve({ got, bytes, ms: Date.now() - t0 });
+      });
+    });
+
+  // 손님 연결 하나 8Mbps(초당 1MB, 순간 1MB) — 3MB 를 몰아 보내면 다 오지만 약 2초 걸림
+  const r2 = await createRelay({ port: 0, host: '127.0.0.1', guestMbps: 8, jamMbps: 0 });
+  const c2 = new WebSocket(`ws://127.0.0.1:${r2.port}/host`);
+  const rm2 = JSON.parse((await nextMsg(c2)).d);
+  const p2 = await pair(r2, c2, rm2.route, rm2.token);
+  const chunk = Buffer.alloc(50 * 1024, 7);
+  const done = collect(p2.g, 60);
+  for (let i = 0; i < 60; i++) p2.acc.send(chunk, { binary: true });
+  const res = await done;
+  assert.equal(res.got, 60);
+  assert.equal(res.bytes, 60 * chunk.length);
+  assert.ok(res.ms >= 1500 && res.ms < 6000, `took ${res.ms}ms`);
+  assert.ok(JSON.parse((await get(r2.port, '/status')).body).pauses > 0);
+  ok(`손님 연결 한도(8Mbps): 3MB 를 하나도 버리지 않고 ${res.ms}ms 에 걸쳐 전달 (보내는 쪽을 잠깐 멈춤)`);
+
+  // 메시지 수 한도(초당 200, 순간 400)도 버리지 않음: 작은 메시지 700개 → 모두 도착, 약 1.5초
+  const pausesBefore = JSON.parse((await get(r2.port, '/status')).body).pauses;
+  const small = collect(p2.acc, 700);
+  for (let i = 0; i < 700; i++) p2.g.send(`m${i}`);
+  const rs = await small;
+  assert.equal(rs.got, 700);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(JSON.parse((await get(r2.port, '/status')).body).pauses > pausesBefore);
+  ok('메시지 수 한도(초당 200)를 넘어도 버리지 않음 — 700개 모두 도착, 보내는 쪽은 잠깐 멈춤 (예전에는 400개 넘으면 버렸음)');
+  for (const w of [c2, p2.g, p2.acc]) w.close();
+  await r2.close();
+
+  // Jam 하나 합계 8Mbps: 손님 두 명에게 1.5MB 씩 → 합 3MB 가 약 2초
+  const r3 = await createRelay({ port: 0, host: '127.0.0.1', guestMbps: 0, jamMbps: 8 });
+  const c3 = new WebSocket(`ws://127.0.0.1:${r3.port}/host`);
+  const rm3 = JSON.parse((await nextMsg(c3)).d);
+  const pa = await pair(r3, c3, rm3.route, rm3.token);
+  const pb = await pair(r3, c3, rm3.route, rm3.token);
+  const da = collect(pa.g, 30);
+  const db = collect(pb.g, 30);
+  for (let i = 0; i < 30; i++) {
+    pa.acc.send(chunk, { binary: true });
+    pb.acc.send(chunk, { binary: true });
+  }
+  const [ra, rb] = await Promise.all([da, db]);
+  assert.equal(ra.got + rb.got, 60);
+  assert.ok(Math.max(ra.ms, rb.ms) >= 1500, `took ${ra.ms}/${rb.ms}ms`);
+  const st3 = JSON.parse((await get(r3.port, '/status')).body);
+  assert.deepEqual(st3.limits, { maxMbps: 0, jamMbps: 8, guestMbps: 0 });
+  ok(`Jam 하나 합계 한도(8Mbps): 손님 두 명 합 3MB 를 ${Math.max(ra.ms, rb.ms)}ms 에 걸쳐 모두 전달 · /status 에 한도 표시`);
+  for (const w of [c3, pa.g, pa.acc, pb.g, pb.acc]) w.close();
+  await r3.close();
   console.log(`\n중계 서버 테스트 통과 (${n}개)`);
   process.exit(0);
 })().catch((e) => {
