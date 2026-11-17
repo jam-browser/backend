@@ -28,6 +28,13 @@
  *   JAM_RELAY_PFX_PASS / pfxPass   (선택) PFX 비밀번호
  *   JAM_RELAY_CERT, JAM_RELAY_KEY / cert, key   (선택) PEM 인증서/키
  *   JAM_RELAY_MAX_ROUTES / maxRoutes            동시에 열 수 있는 Jam 수 (기본 200)
+ *   JAM_RELAY_MAX_MBPS / maxMbps                서버 전체 전송 한도 Mbps (기본 0 = 제한 없음)
+ *   JAM_RELAY_JAM_MBPS / jamMbps                Jam 하나(호스트 + 손님 모두) 한도 Mbps (기본 200)
+ *   JAM_RELAY_GUEST_MBPS / guestMbps            손님 연결 하나의 한쪽 방향 한도 Mbps (기본 40)
+ *
+ * 한도를 넘으면 데이터를 버리지 않고, 보내는 쪽 연결을 잠깐 멈춰요 (TCP 가 자연스럽게 느려짐).
+ * 화면 미러링을 하는 호스트 앱은 밀림을 보고 초당 장수 · 화질을 낮추고, 파일 전송은 기다렸다 이어서 보내요.
+ * (내용은 암호화돼 있어서 서버는 무엇이 미러링인지 모르고, 바이트 양만 봐요)
  */
 const http = require('http');
 const https = require('https');
@@ -43,8 +50,27 @@ const MAX_PAYLOAD = 64 * 1024;
 const ROUTE_GRACE = 2 * 60e3; // 호스트가 잠깐 끊겨도 2분은 경로 유지
 const PENDING_TIMEOUT = 15000; // 호스트가 15초 안에 받지 않으면 손님 연결 종료
 const MAX_BUFFER = 64; // 짝이 맺어지기 전에 쌓아 둘 메시지 수
-const RATE_PER_SEC = 200; // 연결 하나당 초당 메시지 (커서 등)
+const RATE_PER_SEC = 200; // 연결 하나당 초당 메시지 (커서 등) — 넘으면 버리지 않고 잠깐 멈춤
 const RATE_BURST = 400;
+const HIGH_WATER = 2 * 1024 * 1024; // 받는 쪽에 이만큼 쌓이면 보내는 쪽을 멈춤
+const mbps = (n) => (Number(n) > 0 ? (Number(n) * 1e6) / 8 : 0); // Mbps → 초당 바이트 (0 = 제한 없음)
+
+// 토큰 통: take(n) → 지금부터 기다려야 하는 ms (0 이면 바로)
+function bucket(rate, burst = rate) {
+  let tokens = burst;
+  let at = Date.now();
+  return {
+    rate,
+    take(n) {
+      if (!rate) return 0;
+      const now = Date.now();
+      tokens = Math.min(burst, tokens + ((now - at) / 1000) * rate);
+      at = now;
+      tokens -= n;
+      return tokens >= 0 ? 0 : Math.ceil((-tokens / rate) * 1000);
+    },
+  };
+}
 
 const b32 = 'abcdefghijkmnpqrstuvwxyz23456789';
 const randomId = (n) => Array.from(crypto.randomBytes(n), (x) => b32[x % b32.length]).join('');
@@ -56,7 +82,9 @@ const safeEq = (a, b) => {
   return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
 };
 
-function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null } = {}) {
+function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 200, guestMbps = 40 } = {}) {
+  const serverBucket = bucket(mbps(maxMbps));
+  const traffic = { bytes: 0, paused: 0 }; // /status 용
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
   const connsPerIp = new Map();
   let nextGuestId = 1;
@@ -65,6 +93,9 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
     routes: routes.size,
     guests: [...routes.values()].reduce((n, r) => n + r.guests.size, 0),
     connections: [...connsPerIp.values()].reduce((a, b) => a + b, 0),
+    bytes: traffic.bytes,
+    pauses: traffic.paused,
+    limits: { maxMbps: Number(maxMbps) || 0, jamMbps: Number(jamMbps) || 0, guestMbps: Number(guestMbps) || 0 },
   });
 
   const handler = (req, res) => {
@@ -89,16 +120,33 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
 
   const sendJson = (ws, obj) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(obj));
 
-  function limiter() {
-    let tokens = RATE_BURST;
-    let last = Date.now();
-    return () => {
-      const now = Date.now();
-      tokens = Math.min(RATE_BURST, tokens + ((now - last) / 1000) * RATE_PER_SEC);
-      last = now;
-      if (tokens < 1) return false;
-      tokens--;
-      return true;
+  // 연결 하나의 한쪽 방향: 메시지 수 · 바이트 한도를 넘거나 받는 쪽이 밀리면 보내는 쪽(src)을 잠깐 멈춘다
+  function flow(src, dst, routeBucket) {
+    const count = bucket(RATE_PER_SEC, RATE_BURST);
+    const bytes = bucket(mbps(guestMbps), mbps(guestMbps)); // 1초 분량까지 몰아서 보낼 수 있음
+    let timer = null;
+    const resumeLater = (ms) => {
+      if (timer) return;
+      if (!src.isPaused) {
+        src.pause();
+        traffic.paused++;
+      }
+      timer = setTimeout(function check() {
+        timer = null;
+        if (src.readyState !== WebSocket.OPEN) return;
+        if (dst.readyState === WebSocket.OPEN && dst.bufferedAmount > HIGH_WATER / 2) {
+          timer = setTimeout(check, 50); // 받는 쪽이 아직 밀림
+          return;
+        }
+        src.resume();
+      }, Math.max(10, Math.min(ms, 2000)));
+    };
+    return (data) => {
+      const n = data.length || data.byteLength || 0;
+      traffic.bytes += n;
+      const wait = Math.max(count.take(1), bytes.take(n), routeBucket.take(n), serverBucket.take(n));
+      if (wait > 0) resumeLater(wait);
+      else if (dst.bufferedAmount > HIGH_WATER) resumeLater(50);
     };
   }
 
@@ -112,18 +160,19 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
   }
 
   // 두 연결을 이어서 데이터를 그대로 넘긴다 (텍스트/바이너리 구분 유지)
-  function pipe(a, b, label) {
-    const okA = limiter();
-    const okB = limiter();
+  // 버리지 않는다: 한도를 넘으면 보내는 쪽을 잠깐 멈춤 (받은 메시지는 그대로 전달)
+  function pipe(a, b, label, routeBucket = bucket(0)) {
+    const upFlow = flow(a, b, routeBucket);
+    const downFlow = flow(b, a, routeBucket);
     a.on('message', (data, isBinary) => {
-      if (!okA()) return;
       if (onFrame) onFrame(label, 'up', data, isBinary);
       if (b.readyState === WebSocket.OPEN) b.send(data, { binary: isBinary });
+      upFlow(data);
     });
     b.on('message', (data, isBinary) => {
-      if (!okB()) return;
       if (onFrame) onFrame(label, 'down', data, isBinary);
       if (a.readyState === WebSocket.OPEN) a.send(data, { binary: isBinary });
+      downFlow(data);
     });
     const end = () => {
       if (a.readyState <= WebSocket.OPEN) a.close();
@@ -179,7 +228,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
           if (routes.size >= maxRoutes) return ws.close(4429, 'relay full');
           do route = randomId(10);
           while (routes.has(route));
-          routes.set(route, { token: crypto.randomBytes(24).toString('base64url'), control: ws, guests: new Map(), closeTimer: null });
+          routes.set(route, { token: crypto.randomBytes(24).toString('base64url'), control: ws, guests: new Map(), closeTimer: null, bucket: bucket(mbps(jamMbps)) });
           log(`route ${route} opened by ${maskIp(ip)}`);
         }
         const r = routes.get(route);
@@ -225,7 +274,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
         guest.paired = true;
         clearTimeout(guest.timer);
         guest.ws.off('message', guest.take);
-        pipe(guest.ws, ws, `${parts[1]}#${parts[2]}`);
+        pipe(guest.ws, ws, `${parts[1]}#${parts[2]}`, r.bucket);
         for (const [data, isBinary] of guest.buffer) ws.send(data, { binary: isBinary });
         guest.buffer = [];
         return;
@@ -296,7 +345,15 @@ function loadSettings(args) {
   let tls = null;
   if (pfx) tls = { pfx: fs.readFileSync(pfx), passphrase: pfxPass || undefined };
   else if (cert && key) tls = { cert: fs.readFileSync(cert), key: fs.readFileSync(key) };
-  return { port, tls, maxRoutes: Number(env.JAM_RELAY_MAX_ROUTES || cfg.maxRoutes || 200) };
+  const num = (v, d) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
+  return {
+    port,
+    tls,
+    maxRoutes: Number(env.JAM_RELAY_MAX_ROUTES || cfg.maxRoutes || 200),
+    maxMbps: num(env.JAM_RELAY_MAX_MBPS ?? cfg.maxMbps, 0),
+    jamMbps: num(env.JAM_RELAY_JAM_MBPS ?? cfg.jamMbps, 200),
+    guestMbps: num(env.JAM_RELAY_GUEST_MBPS ?? cfg.guestMbps, 40),
+  };
 }
 
 // 자동 업데이트: current.txt 가 다른 버전을 가리키면, 진행 중인 Jam 이 없을 때 종료 → run-relay.cmd 가 새 버전으로 다시 켠다
@@ -329,7 +386,7 @@ if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
   const s = loadSettings(args);
-  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, log })
+  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, maxMbps: s.maxMbps, jamMbps: s.jamMbps, guestMbps: s.guestMbps, log })
     .then((relay) => {
       log(`Jam relay ${VERSION} listening on ${s.tls ? 'wss' : 'ws'}://0.0.0.0:${relay.port}`);
       if (args.home) watchForUpdate(args.home, relay, log);
