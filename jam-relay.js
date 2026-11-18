@@ -29,8 +29,10 @@
  *   JAM_RELAY_CERT, JAM_RELAY_KEY / cert, key   (선택) PEM 인증서/키
  *   JAM_RELAY_MAX_ROUTES / maxRoutes            동시에 열 수 있는 Jam 수 (기본 200)
  *   JAM_RELAY_MAX_MBPS / maxMbps                서버 전체 전송 한도 Mbps (기본 0 = 제한 없음)
- *   JAM_RELAY_JAM_MBPS / jamMbps                Jam 하나(호스트 + 손님 모두) 한도 Mbps (기본 200)
- *   JAM_RELAY_GUEST_MBPS / guestMbps            손님 연결 하나의 한쪽 방향 한도 Mbps (기본 40)
+ *   JAM_RELAY_JAM_MBPS / jamMbps                Jam 하나(호스트 + 손님 모두) 한도 Mbps (기본 0 = 제한 없음)
+ *   JAM_RELAY_GUEST_MBPS / guestMbps            손님 연결 하나의 한쪽 방향 한도 Mbps (기본 0 = 제한 없음)
+ *   JAM_RELAY_MAX_GUESTS / maxGuests            Jam 하나의 손님 수 (기본 64)
+ *   JAM_RELAY_MSG_RATE / msgRate                연결 하나의 초당 메시지 수 (기본 0 = 제한 없음)
  *
  * 한도를 넘으면 데이터를 버리지 않고, 보내는 쪽 연결을 잠깐 멈춰요 (TCP 가 자연스럽게 느려짐).
  * 화면 미러링을 하는 호스트 앱은 밀림을 보고 초당 장수 · 화질을 낮추고, 파일 전송은 기다렸다 이어서 보내요.
@@ -44,14 +46,11 @@ const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const VERSION = require('./package.json').version;
-const MAX_GUESTS_PER_ROUTE = 16;
 const MAX_CONNS_PER_IP = 30;
 const MAX_PAYLOAD = 64 * 1024;
 const ROUTE_GRACE = 2 * 60e3; // 호스트가 잠깐 끊겨도 2분은 경로 유지
 const PENDING_TIMEOUT = 15000; // 호스트가 15초 안에 받지 않으면 손님 연결 종료
 const MAX_BUFFER = 64; // 짝이 맺어지기 전에 쌓아 둘 메시지 수
-const RATE_PER_SEC = 200; // 연결 하나당 초당 메시지 (커서 등) — 넘으면 버리지 않고 잠깐 멈춤
-const RATE_BURST = 400;
 const HIGH_WATER = 2 * 1024 * 1024; // 받는 쪽에 이만큼 쌓이면 보내는 쪽을 멈춤
 const mbps = (n) => (Number(n) > 0 ? (Number(n) * 1e6) / 8 : 0); // Mbps → 초당 바이트 (0 = 제한 없음)
 
@@ -82,7 +81,8 @@ const safeEq = (a, b) => {
   return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
 };
 
-function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 200, guestMbps = 40 } = {}) {
+// 한도는 모두 설정으로. 기본은 제한 없음 (0) — 서버 주인이 필요하면 config.json 으로 정함. 넘으면 버리지 않고 잠깐 멈춤
+function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 0, guestMbps = 0, maxGuests = 64, msgRate = 0 } = {}) {
   const serverBucket = bucket(mbps(maxMbps));
   const traffic = { bytes: 0, paused: 0 }; // /status 용
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
@@ -95,7 +95,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
     connections: [...connsPerIp.values()].reduce((a, b) => a + b, 0),
     bytes: traffic.bytes,
     pauses: traffic.paused,
-    limits: { maxMbps: Number(maxMbps) || 0, jamMbps: Number(jamMbps) || 0, guestMbps: Number(guestMbps) || 0 },
+    limits: { maxMbps: Number(maxMbps) || 0, jamMbps: Number(jamMbps) || 0, guestMbps: Number(guestMbps) || 0, maxGuests, msgRate: Number(msgRate) || 0 },
   });
 
   const handler = (req, res) => {
@@ -122,7 +122,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
 
   // 연결 하나의 한쪽 방향: 메시지 수 · 바이트 한도를 넘거나 받는 쪽이 밀리면 보내는 쪽(src)을 잠깐 멈춘다
   function flow(src, dst, routeBucket) {
-    const count = bucket(RATE_PER_SEC, RATE_BURST);
+    const count = bucket(Number(msgRate) || 0, (Number(msgRate) || 0) * 2);
     const bytes = bucket(mbps(guestMbps), mbps(guestMbps)); // 1초 분량까지 몰아서 보낼 수 있음
     let timer = null;
     const resumeLater = (ms) => {
@@ -247,7 +247,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
       if (parts[0] === 'join' && parts.length === 2) {
         const r = routes.get(parts[1]);
         if (!r || !r.control) return ws.close(4404, 'no such jam');
-        if (r.guests.size >= MAX_GUESTS_PER_ROUTE) return ws.close(4429, 'jam full');
+        if (r.guests.size >= maxGuests) return ws.close(4429, 'jam full');
         const id = String(nextGuestId++);
         const guest = { ws, buffer: [], paired: false };
         r.guests.set(id, guest);
@@ -351,8 +351,10 @@ function loadSettings(args) {
     tls,
     maxRoutes: Number(env.JAM_RELAY_MAX_ROUTES || cfg.maxRoutes || 200),
     maxMbps: num(env.JAM_RELAY_MAX_MBPS ?? cfg.maxMbps, 0),
-    jamMbps: num(env.JAM_RELAY_JAM_MBPS ?? cfg.jamMbps, 200),
-    guestMbps: num(env.JAM_RELAY_GUEST_MBPS ?? cfg.guestMbps, 40),
+    jamMbps: num(env.JAM_RELAY_JAM_MBPS ?? cfg.jamMbps, 0),
+    guestMbps: num(env.JAM_RELAY_GUEST_MBPS ?? cfg.guestMbps, 0),
+    maxGuests: Math.max(1, Math.min(1000, num(env.JAM_RELAY_MAX_GUESTS ?? cfg.maxGuests, 64))),
+    msgRate: num(env.JAM_RELAY_MSG_RATE ?? cfg.msgRate, 0),
   };
 }
 
@@ -386,7 +388,7 @@ if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
   const s = loadSettings(args);
-  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, maxMbps: s.maxMbps, jamMbps: s.jamMbps, guestMbps: s.guestMbps, log })
+  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, maxMbps: s.maxMbps, jamMbps: s.jamMbps, guestMbps: s.guestMbps, maxGuests: s.maxGuests, msgRate: s.msgRate, log })
     .then((relay) => {
       log(`Jam relay ${VERSION} listening on ${s.tls ? 'wss' : 'ws'}://0.0.0.0:${relay.port}`);
       if (args.home) watchForUpdate(args.home, relay, log);
