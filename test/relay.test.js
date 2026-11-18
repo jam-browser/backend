@@ -26,6 +26,7 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
   let n = 0;
   const ok = (s) => console.log(`  ✓ ${s}`, ++n && '');
   const relay = await createRelay({ port: 0, host: '127.0.0.1' });
+  assert.deepEqual(JSON.parse((await get(relay.port, '/status')).body).limits, { maxMbps: 0, jamMbps: 0, guestMbps: 0, maxGuests: 64, msgRate: 0 });
   const base = `ws://127.0.0.1:${relay.port}`;
 
   assert.equal((await get(relay.port, '/version')).body, VERSION);
@@ -100,7 +101,7 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
     });
 
   // 손님 연결 하나 8Mbps(초당 1MB, 순간 1MB) — 3MB 를 몰아 보내면 다 오지만 약 2초 걸림
-  const r2 = await createRelay({ port: 0, host: '127.0.0.1', guestMbps: 8, jamMbps: 0 });
+  const r2 = await createRelay({ port: 0, host: '127.0.0.1', guestMbps: 8, jamMbps: 0, msgRate: 200 });
   const c2 = new WebSocket(`ws://127.0.0.1:${r2.port}/host`);
   const rm2 = JSON.parse((await nextMsg(c2)).d);
   const p2 = await pair(r2, c2, rm2.route, rm2.token);
@@ -122,7 +123,7 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
   assert.equal(rs.got, 700);
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(JSON.parse((await get(r2.port, '/status')).body).pauses > pausesBefore);
-  ok('메시지 수 한도(초당 200)를 넘어도 버리지 않음 — 700개 모두 도착, 보내는 쪽은 잠깐 멈춤 (예전에는 400개 넘으면 버렸음)');
+  ok('메시지 수 한도(설정 msgRate 200)를 넘어도 버리지 않음 — 700개 모두 도착, 보내는 쪽은 잠깐 멈춤');
   for (const w of [c2, p2.g, p2.acc]) w.close();
   await r2.close();
 
@@ -142,7 +143,7 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
   assert.equal(ra.got + rb.got, 60);
   assert.ok(Math.max(ra.ms, rb.ms) >= 1500, `took ${ra.ms}/${rb.ms}ms`);
   const st3 = JSON.parse((await get(r3.port, '/status')).body);
-  assert.deepEqual(st3.limits, { maxMbps: 0, jamMbps: 8, guestMbps: 0 });
+  assert.deepEqual(st3.limits, { maxMbps: 0, jamMbps: 8, guestMbps: 0, maxGuests: 64, msgRate: 0 });
   ok(`Jam 하나 합계 한도(8Mbps): 손님 두 명 합 3MB 를 ${Math.max(ra.ms, rb.ms)}ms 에 걸쳐 모두 전달 · /status 에 한도 표시`);
   for (const w of [c3, pa.g, pa.acc, pb.g, pb.acc]) w.close();
   await r3.close();
