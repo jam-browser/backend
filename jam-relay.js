@@ -21,6 +21,8 @@
  *   GET /          "Jam relay"
  *   GET /version   현재 버전 (자동 업데이트 확인용)
  *   GET /status    (같은 PC 에서만) 진행 중인 Jam 수 · 손님 수
+ *   GET /presence/<ID>  다른 기기에서 이어 보기: 호스트 앱이 제어 연결로 맡긴 암호문 (없으면 404, IP 마다 1분에 30번)
+ *        ID 는 브라우저 계정 개인 키에서 만든 무작위 값, 암호문은 같은 계정 기기만 풀 수 있어요. 메모리에만, 호스트 연결이 끊기면 지움
  *
  * 환경 변수 / config.json:
  *   PORT / port                    포트 (기본 3031)
@@ -52,6 +54,10 @@ const ROUTE_GRACE = 2 * 60e3; // 호스트가 잠깐 끊겨도 2분은 경로 �
 const PENDING_TIMEOUT = 15000; // 호스트가 15초 안에 받지 않으면 손님 연결 종료
 const MAX_BUFFER = 64; // 짝이 맺어지기 전에 쌓아 둘 메시지 수
 const HIGH_WATER = 2 * 1024 * 1024; // 받는 쪽에 이만큼 쌓이면 보내는 쪽을 멈춤
+// 다른 기기에서 이어 보기: 호스트가 맡긴 { 무작위 ID → 암호문 }. 서버는 내용을 풀 수 없고(계정 키는 기기에만), 메모리에만 둠
+const PRESENCE_ID = /^[A-Za-z0-9_-]{43}$/;
+const MAX_PRESENCE_BLOB = 2048;
+const PRESENCE_LOOKUPS_PER_MIN = 30; // IP 하나가 1분에 찾을 수 있는 횟수
 const mbps = (n) => (Number(n) > 0 ? (Number(n) * 1e6) / 8 : 0); // Mbps → 초당 바이트 (0 = 제한 없음)
 
 // 토큰 통: take(n) → 지금부터 기다려야 하는 ms (0 이면 바로)
@@ -88,11 +94,21 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
   const connsPerIp = new Map();
   let nextGuestId = 1;
+  const presence = new Map(); // id → { blob, route, at } — 그 Jam 의 호스트 연결이 있는 동안만
+  const lookups = new Map(); // ip → { n, reset }
+  function dropPresence(route) {
+    const r = routes.get(route);
+    if (!r || !r.presence) return;
+    const p = presence.get(r.presence);
+    if (p && p.route === route) presence.delete(r.presence);
+    r.presence = null;
+  }
 
   const stats = () => ({
     routes: routes.size,
     guests: [...routes.values()].reduce((n, r) => n + r.guests.size, 0),
     connections: [...connsPerIp.values()].reduce((a, b) => a + b, 0),
+    presence: presence.size,
     bytes: traffic.bytes,
     pauses: traffic.paused,
     limits: { maxMbps: Number(maxMbps) || 0, jamMbps: Number(jamMbps) || 0, guestMbps: Number(guestMbps) || 0, maxGuests, msgRate: Number(msgRate) || 0 },
@@ -111,6 +127,25 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify({ version: VERSION, ...stats() }));
+    }
+    // 다른 기기에서 이어 보기: 무작위 ID 로 암호문 찾기 (없으면 404 — ID 가 있는지 없는지만 알 수 있고, 내용은 못 풂)
+    const pm = /^\/presence\/([A-Za-z0-9_-]{43})$/.exec(url);
+    if (pm) {
+      const json = (code, obj) => {
+        res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.method !== 'GET') return json(405, { error: 'method' });
+      const ip = req.socket.remoteAddress || '';
+      const now = Date.now();
+      let l = lookups.get(ip);
+      if (!l || l.reset < now) lookups.set(ip, (l = { n: 0, reset: now + 60e3 }));
+      if (++l.n > PRESENCE_LOOKUPS_PER_MIN) return json(429, { error: 'slow down' });
+      if (lookups.size > 10000) for (const [k, v] of lookups) if (v.reset < now) lookups.delete(k);
+      const p = presence.get(pm[1]);
+      const r = p && routes.get(p.route);
+      if (!p || !r || !r.control) return json(404, { error: 'none' });
+      return json(200, { blob: p.blob, at: p.at });
     }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Jam relay\n');
@@ -153,6 +188,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
   function closeRoute(route, reason) {
     const r = routes.get(route);
     if (!r) return;
+    dropPresence(route);
     routes.delete(route);
     clearTimeout(r.closeTimer);
     for (const g of r.guests.values()) g.ws.close(4410, reason);
@@ -233,7 +269,23 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
         }
         const r = routes.get(route);
         sendJson(ws, { type: 'route', route, token: r.token });
-        ws.on('message', () => {});
+        // 호스트 제어 연결로 오는 메시지: 다른 기기에서 이어 보기 { type: 'presence', id, blob } (blob 이 없으면 지움)
+        ws.on('message', (raw, isBinary) => {
+          if (isBinary || raw.length > 4096) return;
+          let m;
+          try {
+            m = JSON.parse(raw);
+          } catch {
+            return;
+          }
+          const cur = routes.get(route);
+          if (!m || m.type !== 'presence' || !cur || cur.control !== ws) return;
+          dropPresence(route);
+          if (typeof m.id === 'string' && PRESENCE_ID.test(m.id) && typeof m.blob === 'string' && m.blob.length <= MAX_PRESENCE_BLOB && /^[A-Za-z0-9_-]+$/.test(m.blob)) {
+            presence.set(m.id, { blob: m.blob, route, at: Date.now() });
+            cur.presence = m.id;
+          }
+        });
         ws.on('close', () => {
           const cur = routes.get(route);
           if (!cur || cur.control !== ws) return;

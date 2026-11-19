@@ -147,6 +147,55 @@ const closeCode = (ws) => new Promise((r) => ws.once('close', (c) => r(c)));
   ok(`Jam 하나 합계 한도(8Mbps): 손님 두 명 합 3MB 를 ${Math.max(ra.ms, rb.ms)}ms 에 걸쳐 모두 전달 · /status 에 한도 표시`);
   for (const w of [c3, pa.g, pa.acc, pb.g, pb.acc]) w.close();
   await r3.close();
+
+  // 다른 기기에서 이어 보기: 호스트 제어 연결만 맡길 수 있고, 무작위 ID 로 찾기 · 호스트가 떠나면 사라짐 · 찾기 횟수 제한
+  const r4 = await createRelay({ port: 0, host: '127.0.0.1' });
+  const b4 = `ws://127.0.0.1:${r4.port}`;
+  const pid = require('crypto').randomBytes(32).toString('base64url');
+  const blob = require('crypto').randomBytes(200).toString('base64url');
+  const c4 = new WebSocket(`${b4}/host`);
+  const rt4 = JSON.parse((await nextMsg(c4)).d);
+  assert.equal((await get(r4.port, `/presence/${pid}`)).status, 404);
+  c4.send(JSON.stringify({ type: 'presence', id: pid, blob }));
+  await new Promise((r) => setTimeout(r, 100));
+  const found = await get(r4.port, `/presence/${pid}`);
+  assert.equal(found.status, 200);
+  assert.equal(JSON.parse(found.body).blob, blob);
+  assert.equal(JSON.parse((await get(r4.port, '/status')).body).presence, 1);
+  ok('호스트가 맡긴 암호문을 무작위 ID 로 찾음');
+  // 손님 연결은 맡길 수 없음 (그대로 호스트에게 전달될 뿐)
+  const g4 = new WebSocket(`${b4}/join/${rt4.route}`);
+  await opened(g4);
+  await nextMsg(c4); // incoming
+  const pid2 = require('crypto').randomBytes(32).toString('base64url');
+  g4.send(JSON.stringify({ type: 'presence', id: pid2, blob }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await get(r4.port, `/presence/${pid2}`)).status, 404);
+  // 형식이 틀리면 저장 안 함 (지금 것은 지움)
+  for (const bad of [{ id: 'short', blob }, { id: pid, blob: 'x'.repeat(3000) }, { id: pid, blob: '<script>' }]) {
+    c4.send(JSON.stringify({ type: 'presence', ...bad }));
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal((await get(r4.port, `/presence/${pid}`)).status, 404, JSON.stringify(bad).slice(0, 40));
+  }
+  ok('손님은 맡길 수 없음 · 형식 · 크기(2KB)가 틀리면 저장 안 함');
+  c4.send(JSON.stringify({ type: 'presence', id: pid, blob }));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await get(r4.port, `/presence/${pid}`)).status, 200);
+  c4.send(JSON.stringify({ type: 'presence', id: null, blob: null }));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await get(r4.port, `/presence/${pid}`)).status, 404);
+  c4.send(JSON.stringify({ type: 'presence', id: pid, blob }));
+  await new Promise((r) => setTimeout(r, 50));
+  c4.close();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await get(r4.port, `/presence/${pid}`)).status, 404);
+  ok('Jam 을 끝내거나(지우기) 호스트 연결이 끊기면 바로 사라짐');
+  let limited = 0;
+  for (let i = 0; i < 40 && !limited; i++) if ((await get(r4.port, `/presence/${pid}`)).status === 429) limited = i;
+  assert.ok(limited > 0 && limited <= 30, String(limited));
+  ok('찾기는 IP 마다 1분에 30번까지 (무작위 ID 를 마구 찍어 보는 것 방지)');
+  g4.close();
+  await r4.close();
   console.log(`\n중계 서버 테스트 통과 (${n}개)`);
   process.exit(0);
 })().catch((e) => {
