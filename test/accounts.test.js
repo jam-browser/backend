@@ -52,8 +52,8 @@ const vaultOf = (tag = 'x', kdf) => ({
   format: 'jam-vault',
   v: 1,
   kdf: kdf || { alg: 'scrypt', N: 131072, r: 8, p: 1, salt: b64(32) },
-  dek: { iv: b64(12), ct: b64(48) },
-  data: { iv: b64(12), ct: Buffer.from(`secret-${tag}`).toString('base64') },
+  dek: b64(93),
+  data: Buffer.from(`secret-${tag}`).toString('base64'),
 });
 const bearer = (t) => ({ Authorization: `Bearer ${t}` });
 
@@ -101,7 +101,8 @@ const bearer = (t) => ({ Authorization: `Bearer ${t}` });
   assert.equal((await post('/account/register', { id: '-abc', auth: newAuth(), vault: vaultOf() })).body.error, 'bad-id');
   assert.equal((await post('/account/register', { id: 'bob', auth: b64(16), vault: vaultOf() })).status, 400);
   assert.equal((await post('/account/register', { id: 'bob', auth: newAuth(), vault: { ...vaultOf(), format: 'x' } })).body.error, 'bad-vault');
-  assert.equal((await post('/account/register', { id: 'bob', auth: newAuth(), vault: { ...vaultOf(), dek: 'str' } })).body.error, 'bad-vault');
+  assert.equal((await post('/account/register', { id: 'bob', auth: newAuth(), vault: { ...vaultOf(), dek: { iv: 'x' } } })).body.error, 'bad-vault');
+  assert.equal((await post('/account/register', { id: 'bob', auth: newAuth(), vault: { ...vaultOf(), data: '' } })).body.error, 'bad-vault');
   assert.equal((await post('/account/register', Buffer.from('{not json'))).body.error, 'bad-json');
   const e409 = await post('/account/register', { id: 'alice.kim', auth: newAuth(), vault: vaultOf() });
   assert.equal(e409.status, 409);
@@ -166,10 +167,10 @@ const bearer = (t) => ({ Authorization: `Bearer ${t}` });
   assert.equal(hugeChunked.status, 413);
   assert.equal((await post('/account/prelogin', { id: 'alice.kim' })).status, 200);
   const bigVault = vaultOf('big', v1.kdf);
-  bigVault.data.ct = 'A'.repeat(5 * 1024 * 1024 + 100); // 본문은 6MB 안이지만 보관함이 5MB 넘음
+  bigVault.data = 'A'.repeat(5 * 1024 * 1024 + 100); // 본문은 6MB 안이지만 보관함이 5MB 넘음
   assert.equal((await call(P, 'PUT', '/account/vault', { baseRev: 2, vault: bigVault }, bearer(tA))).status, 413);
   const okVault = vaultOf('fits', v1.kdf);
-  okVault.data.ct = 'A'.repeat(4 * 1024 * 1024);
+  okVault.data = 'A'.repeat(4 * 1024 * 1024);
   assert.deepEqual((await call(P, 'PUT', '/account/vault', { baseRev: 2, vault: okVault }, bearer(tA))).body, { rev: 3 });
   assert.equal((await call(P, 'GET', '/account/nope')).status, 404);
   assert.equal((await call(P, 'GET', '/account/login')).status, 405);

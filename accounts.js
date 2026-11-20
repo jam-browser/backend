@@ -303,7 +303,9 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
   }
   // 보관함은 열어 보지 않는다: 형식 표시와 kdf · dek · data 객체가 있는지만 확인
   function checkVault(v) {
-    if (!isObj(v) || v.format !== 'jam-vault' || !isObj(v.kdf) || !isObj(v.dek) || !isObj(v.data)) return 'bad';
+    // 앱의 금고 파일: dek · data 는 암호문(base64 문자열), kdf 는 객체. 내용은 보지 않음
+    const sealed = (x) => typeof x === 'string' && x.length > 0 && /^[A-Za-z0-9+/=]+$/.test(x);
+    if (!isObj(v) || v.format !== 'jam-vault' || !isObj(v.kdf) || !sealed(v.dek) || !sealed(v.data)) return 'bad';
     if (Buffer.byteLength(JSON.stringify(v)) > MAX_VAULT) return 'big';
     return null;
   }
