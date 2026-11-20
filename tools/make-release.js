@@ -20,7 +20,7 @@ const { signRelease, verifyRelease, sha256hex } = require('../release-sign');
 const ROOT = path.join(__dirname, '..');
 const SYSTEM_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 const TAR = process.platform === 'win32' && fs.existsSync(SYSTEM_TAR) ? SYSTEM_TAR : 'tar';
-const FILES = ['jam-relay.js', 'updater.js', 'release-sign.js', 'package.json', 'package-lock.json', 'release-key.pub.pem', 'LICENSE', 'README.md', 'windows'];
+const FILES = ['jam-relay.js', 'accounts.js', 'updater.js', 'release-sign.js', 'package.json', 'package-lock.json', 'release-key.pub.pem', 'LICENSE', 'README.md', 'windows'];
 
 function copy(src, dst) {
   const st = fs.statSync(src);

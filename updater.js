@@ -262,7 +262,7 @@ async function main() {
   }
   const pkg = readJson(path.join(tmp, 'package.json'));
   if (pkg.version !== latest) throw new Error(`압축 안의 버전(${pkg.version})이 릴리스(${latest})와 달라요`);
-  for (const need of ['jam-relay.js', 'updater.js', 'release-sign.js', 'release-key.pub.pem', path.join('node_modules', 'ws', 'package.json')]) {
+  for (const need of ['jam-relay.js', 'accounts.js', 'updater.js', 'release-sign.js', 'release-key.pub.pem', path.join('node_modules', 'ws', 'package.json')]) {
     if (!fs.existsSync(path.join(tmp, need))) throw new Error(`압축에 ${need} 가 없어요`);
   }
   const test = await selfTest(tmp, latest);

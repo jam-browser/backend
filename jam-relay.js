@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Jam 중계 서버 (라우팅 전용)
+ * Jam 중계 서버 (라우팅) + 브라우저 계정
  *
  * 호스트 PC와 참여자 사이에 "길만 이어주는" 서버예요.
  *  - 호스트 앱이 먼저 중계 서버에 접속해 경로 번호(route)를 받는다           →  /host
@@ -9,20 +9,42 @@
  *  - 그 뒤로는 두 연결 사이에서 데이터를 **그대로** 넘겨줄 뿐이에요
  *
  * 내용은 호스트와 참여자 사이에서 이미 암호화되어 있고(초대 코드의 비밀키), 중계 서버는 키가 없어서 볼 수 없어요.
- * 아무것도 저장하지 않아요. 기록하는 것은 접속/종료 로그(시간, IP 일부)뿐이에요.
+ * Jam 데이터는 아무것도 저장하지 않아요. 기록하는 것은 접속/종료 로그(시간, IP 일부)뿐이에요.
+ *
+ * 브라우저 계정(accounts.js)만 디스크에 저장해요: 아이디, 앱이 이미 암호화한 보관함(서버는 열 수 없음),
+ * 비밀번호에서 만든 로그인 확인 값(비밀번호 자체는 아님). 데이터 폴더는 꼭 백업하세요.
  *
  * 실행:
  *   node jam-relay.js                       포트 3031 (또는 환경 변수 PORT)
  *   node jam-relay.js --config C:\JamRelay\config.json --home C:\JamRelay
  *        --home 을 주면 그 폴더의 current.txt 를 지켜보다가, 자동 업데이트로 버전이 바뀌면
  *        진행 중인 Jam 이 없을 때 스스로 종료한다 → 실행 스크립트(run-relay.cmd)가 새 버전으로 다시 켠다
+ *   node jam-relay.js --invite [--uses N (기본 1)] [--days D (기본 7)] [--home <폴더> | --data <폴더>]
+ *        계정 가입용 초대 코드(JINV-XXXX-XXXX-XXXX)를 만들어 출력하고 끝 (서버는 켜지 않음, 코드는 해시만 저장)
+ *   node jam-relay.js --invites [--home <폴더> | --data <폴더>]      쓸 수 있는 초대 코드 목록 (해시 앞부분 · 남은 횟수 · 기한)
  *
  * HTTP:
  *   GET /          "Jam relay"
  *   GET /version   현재 버전 (자동 업데이트 확인용)
- *   GET /status    (같은 PC 에서만) 진행 중인 Jam 수 · 손님 수
+ *   GET /status    (같은 PC 에서만) 진행 중인 Jam 수 · 손님 수 · 계정 수(accounts) · 가입 정책(signup)
  *   GET /presence/<ID>  다른 기기에서 이어 보기: 호스트 앱이 제어 연결로 맡긴 암호문 (없으면 404, IP 마다 1분에 30번)
  *        ID 는 브라우저 계정 개인 키에서 만든 무작위 값, 암호문은 같은 계정 기기만 풀 수 있어요. 메모리에만, 호스트 연결이 끊기면 지움
+ *
+ *   브라우저 계정 (JSON 본문 최대 6MB → 넘으면 413, 응답은 JSON + Cache-Control: no-store,
+ *   Origin 헤더가 있고 file:// · null 이 아니면 403 — 웹페이지는 못 씀. 오류: { error: "<코드>", message: "<한국어>" })
+ *     아이디: 앞뒤 공백 제거 + 소문자, /^[a-z0-9][a-z0-9._-]{2,31}$/ · auth: 32바이트의 base64
+ *     vault: 앱이 암호화한 JSON 객체 (format: "jam-vault", kdf · dek · data 객체, 5MB 이하). 서버는 열지 않고 그대로 보관
+ *   POST /account/prelogin  { id }                          → 200 { kdf }  (없는 아이디도 늘 같은 가짜 kdf → 아이디가 있는지 알 수 없음)
+ *   POST /account/register  { id, auth, vault, invite? }    → 201 { token, rev: 1 } · 409 id-taken · 403 signup-closed / bad-invite
+ *   POST /account/login     { id, auth }                    → 200 { token, rev, vault } · 401 bad-login (없는 아이디 · 틀린 auth 같은 응답)
+ *   GET  /account/vault[?rev=N]   (Authorization: Bearer)   → 200 { rev, vault } · rev 가 같으면 304 · 401 bad-token
+ *   PUT  /account/vault     { baseRev, vault }   (Bearer)   → 200 { rev } · baseRev 가 다르면 409 { error: 'conflict', rev, vault }
+ *   POST /account/password  { auth, newAuth, baseRev, vault } (Bearer) → 200 { rev } · 다른 기기 토큰은 모두 끊김 · 401 bad-login · 409 conflict
+ *   POST /account/logout    (Bearer)                        → 200 {}
+ *   POST /account/delete    { auth } (Bearer)               → 200 {} (계정 파일 · 토큰 삭제) · 401 bad-login
+ *   토큰은 메모리에만 (30일, 계정당 20개) → 서버를 다시 켜면 앱이 다시 로그인
+ *   시도 제한: IP 마다 10분에 비밀번호 확인 실패 20번(+ 틀린 초대 코드) → 429 slow-down, 가입은 IP 마다 1시간에 5번 → 429 slow-down,
+ *            한 아이디가 연속 10번 틀리면 1분 · 2분 · 4분 … 최대 60분 잠금 → 429 locked (성공하면 초기화)
  *
  * 환경 변수 / config.json:
  *   PORT / port                    포트 (기본 3031)
@@ -35,6 +57,9 @@
  *   JAM_RELAY_GUEST_MBPS / guestMbps            손님 연결 하나의 한쪽 방향 한도 Mbps (기본 0 = 제한 없음)
  *   JAM_RELAY_MAX_GUESTS / maxGuests            Jam 하나의 손님 수 (기본 64)
  *   JAM_RELAY_MSG_RATE / msgRate                연결 하나의 초당 메시지 수 (기본 0 = 제한 없음)
+ *   JAM_RELAY_DATA / dataDir                    계정 데이터 폴더 (기본: --home 이 있으면 <home>/data, 없으면 ./data · 명령줄 --data 가 우선)
+ *   JAM_RELAY_SIGNUP / signup                   가입 정책: invite (기본, 초대 코드 필요) · open (누구나) · closed (가입 막음)
+ *   (--config 없이 --home 만 주면 <home>/config.json 을 읽어요)
  *
  * 한도를 넘으면 데이터를 버리지 않고, 보내는 쪽 연결을 잠깐 멈춰요 (TCP 가 자연스럽게 느려짐).
  * 화면 미러링을 하는 호스트 앱은 밀림을 보고 초당 장수 · 화질을 낮추고, 파일 전송은 기다렸다 이어서 보내요.
@@ -46,6 +71,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const { createAccounts, createInvite, listInvites } = require('./accounts');
 
 const VERSION = require('./package.json').version;
 const MAX_CONNS_PER_IP = 30;
@@ -88,8 +114,10 @@ const safeEq = (a, b) => {
 };
 
 // 한도는 모두 설정으로. 기본은 제한 없음 (0) — 서버 주인이 필요하면 config.json 으로 정함. 넘으면 버리지 않고 잠깐 멈춤
-function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 0, guestMbps = 0, maxGuests = 64, msgRate = 0 } = {}) {
+// dataDir · signup: 브라우저 계정 (accounts.js). now: (테스트용) 시계
+function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 0, guestMbps = 0, maxGuests = 64, msgRate = 0, dataDir = 'data', signup = 'invite', now = Date.now } = {}) {
   const serverBucket = bucket(mbps(maxMbps));
+  const accounts = createAccounts({ dataDir, signup, log, now });
   const traffic = { bytes: 0, paused: 0 }; // /status 용
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
   const connsPerIp = new Map();
@@ -126,8 +154,10 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
         return res.end();
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ version: VERSION, ...stats() }));
+      return res.end(JSON.stringify({ version: VERSION, ...stats(), accounts: accounts.count(), signup: accounts.policy }));
     }
+    // 브라우저 계정: 로그인 · 암호화된 보관함 동기화 (accounts.js)
+    if (url === '/account' || url.startsWith('/account/')) return accounts.handle(req, res);
     // 다른 기기에서 이어 보기: 무작위 ID 로 암호문 찾기 (없으면 404 — ID 가 있는지 없는지만 알 수 있고, 내용은 못 풂)
     const pm = /^\/presence\/([A-Za-z0-9_-]{43})$/.exec(url);
     if (pm) {
@@ -379,11 +409,13 @@ function parseArgs(argv) {
   return out;
 }
 
-function loadSettings(args) {
+function loadSettings(args, { withTls = true } = {}) {
   let cfg = {};
-  if (args.config) {
+  // --config 가 없으면 --home 폴더의 config.json (초대 코드 명령에서 --home 만 줘도 같은 설정을 쓰도록)
+  const cfgFile = args.config || (typeof args.home === 'string' && fs.existsSync(path.join(args.home, 'config.json')) ? path.join(args.home, 'config.json') : null);
+  if (cfgFile) {
     try {
-      cfg = JSON.parse(fs.readFileSync(args.config, 'utf8'));
+      cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
     } catch (e) {
       console.error(`config 를 읽지 못했어요: ${e.message}`);
     }
@@ -395,10 +427,18 @@ function loadSettings(args) {
   const cert = env.JAM_RELAY_CERT || cfg.cert;
   const key = env.JAM_RELAY_KEY || cfg.key;
   let tls = null;
-  if (pfx) tls = { pfx: fs.readFileSync(pfx), passphrase: pfxPass || undefined };
+  if (!withTls) tls = null;
+  else if (pfx) tls = { pfx: fs.readFileSync(pfx), passphrase: pfxPass || undefined };
   else if (cert && key) tls = { cert: fs.readFileSync(cert), key: fs.readFileSync(key) };
   const num = (v, d) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? d : Number(v));
+  // 계정 데이터 폴더: --data > JAM_RELAY_DATA > config dataDir > (--home 이 있으면) <home>/data > ./data
+  const dataDir = path.resolve(
+    (typeof args.data === 'string' && args.data) || env.JAM_RELAY_DATA || cfg.dataDir || (typeof args.home === 'string' ? path.join(args.home, 'data') : 'data'),
+  );
+  const signup = String(env.JAM_RELAY_SIGNUP || cfg.signup || 'invite').trim().toLowerCase();
   return {
+    dataDir,
+    signup,
     port,
     tls,
     maxRoutes: Number(env.JAM_RELAY_MAX_ROUTES || cfg.maxRoutes || 200),
@@ -434,15 +474,35 @@ function watchForUpdate(home, relay, log) {
   }, Number(process.env.JAM_RELAY_WATCH_MS) || 15000).unref();
 }
 
-module.exports = { createRelay, VERSION };
+module.exports = { createRelay, createInvite, listInvites, loadSettings, VERSION };
 
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
+  // 초대 코드 만들기 / 목록: 서버를 켜지 않고 바로 끝남
+  if (args.invite || args.invites) {
+    const { dataDir } = loadSettings(args, { withTls: false });
+    try {
+      if (args.invite) {
+        const inv = createInvite({ dataDir, uses: args.uses === undefined ? 1 : Number(args.uses), days: args.days === undefined ? 7 : Number(args.days) });
+        console.log(inv.code);
+        console.log(`(${inv.maxUses}번 쓸 수 있고 ${new Date(inv.exp).toLocaleString()} 까지 유효 · 서버에는 해시만 저장돼서 이 코드는 다시 볼 수 없어요)`);
+      } else {
+        const list = listInvites({ dataDir });
+        if (!list.length) console.log('쓸 수 있는 초대 코드가 없어요');
+        for (const x of list) console.log(`${x.hash}…  남은 횟수 ${x.left}  ~ ${new Date(x.exp).toLocaleString()}`);
+      }
+      process.exit(0);
+    } catch (e) {
+      console.error(`초대 코드를 처리하지 못했어요 (${dataDir}): ${e.message}`);
+      process.exit(1);
+    }
+  }
   const s = loadSettings(args);
-  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, maxMbps: s.maxMbps, jamMbps: s.jamMbps, guestMbps: s.guestMbps, maxGuests: s.maxGuests, msgRate: s.msgRate, log })
+  createRelay({ port: s.port, tls: s.tls, maxRoutes: s.maxRoutes, maxMbps: s.maxMbps, jamMbps: s.jamMbps, guestMbps: s.guestMbps, maxGuests: s.maxGuests, msgRate: s.msgRate, dataDir: s.dataDir, signup: s.signup, log })
     .then((relay) => {
       log(`Jam relay ${VERSION} listening on ${s.tls ? 'wss' : 'ws'}://0.0.0.0:${relay.port}`);
+      log(`accounts: signup ${s.signup}, data ${s.dataDir}`);
       if (args.home) watchForUpdate(args.home, relay, log);
       // 업데이트 전 자체 점검용: 포트를 알려주고 바로 응답할 수 있게
       if (args.selftest) console.log(`SELFTEST_PORT=${relay.port}`);
