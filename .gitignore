@@ -4,3 +4,4 @@ logs/
 *.pem
 !release-key.pub.pem
 LOCAL-SETUP.md
+data/

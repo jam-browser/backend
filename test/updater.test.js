@@ -54,7 +54,7 @@ function getVersion(port) {
   // 공개키만 바꾼 소스 사본 (설치된 서버가 믿는 키 = official.pub)
   const src = path.join(tmp, 'src');
   fs.mkdirSync(src);
-  for (const f of ['jam-relay.js', 'updater.js', 'release-sign.js', 'package.json', 'package-lock.json', 'LICENSE', 'README.md', 'windows']) {
+  for (const f of ['jam-relay.js', 'accounts.js', 'updater.js', 'release-sign.js', 'package.json', 'package-lock.json', 'LICENSE', 'README.md', 'windows']) {
     if (fs.existsSync(path.join(ROOT, f))) fs.cpSync(path.join(ROOT, f), path.join(src, f), { recursive: true });
   }
   fs.writeFileSync(path.join(src, 'release-key.pub.pem'), official.pub);
