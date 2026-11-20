@@ -1,6 +1,6 @@
 {
   "name": "jam-relay",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "Jam Browser 중계 서버 (암호화된 Jam 데이터를 전달만 함) + 브라우저 계정 (서버가 열 수 없는 암호화 보관함 동기화) · 서명된 릴리스로 자동 업데이트",
   "main": "jam-relay.js",
   "private": true,
