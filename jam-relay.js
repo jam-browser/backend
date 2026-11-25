@@ -29,6 +29,10 @@
  *   GET /status    (같은 PC 에서만) 진행 중인 Jam 수 · 손님 수 · 계정 수(accounts) · 가입 정책(signup)
  *   GET /presence/<ID>  다른 기기에서 이어 보기: 호스트 앱이 제어 연결로 맡긴 암호문 (없으면 404, IP 마다 1분에 30번)
  *        ID 는 브라우저 계정 개인 키에서 만든 무작위 값, 암호문은 같은 계정 기기만 풀 수 있어요. 메모리에만, 호스트 연결이 끊기면 지움
+ *   POST /friends/put { items: [{ id, blob }], drop: [id] }  친구 상태 맡기기 (1.2.0+, 3분 뒤 사라짐 · 메모리에만)
+ *   POST /friends/get { ids: [id] }  → { found: { id: blob } }
+ *        ID · 암호문은 친구 둘의 신원 키에서 나와서, 서버는 누가 누구인지 · 온라인인지 · 무슨 사이트인지 몰라요
+ *        한도: 요청당 256개 올리기 / 512개 찾기, 암호문 1KB, IP 마다 1분에 60번 · 1024개. 웹페이지(Origin)는 403
  *
  *   브라우저 계정 (JSON 본문 최대 6MB → 넘으면 413, 응답은 JSON + Cache-Control: no-store,
  *   Origin 헤더가 있고 file:// · null 이 아니면 403 — 웹페이지는 못 씀. 오류: { error: "<코드>", message: "<한국어>" })
@@ -86,6 +90,121 @@ const MAX_PRESENCE_BLOB = 2048;
 const PRESENCE_LOOKUPS_PER_MIN = 30; // IP 하나가 1분에 찾을 수 있는 횟수
 const mbps = (n) => (Number(n) > 0 ? (Number(n) * 1e6) / 8 : 0); // Mbps → 초당 바이트 (0 = 제한 없음)
 
+// ---------- 친구 상태 (1.2.0): { 무작위 ID → 암호문 } 을 잠깐 (메모리에만) ----------
+// ID 와 키는 친구 둘의 신원 키에서 나와서 서버는 누가 누구인지 · 내용(온라인 · 보는 사이트)을 몰라요.
+// 앱이 1분마다 다시 올리고, 3분 동안 안 올리면 사라짐 → 오프라인
+const FRIEND_TTL = 3 * 60e3;
+const FRIEND_MAX_BLOB = 1024;
+const FRIEND_MAX_ITEMS = 256; // 요청 하나에 올리는 · 지우는 수
+const FRIEND_MAX_IDS = 512; // 요청 하나에 찾는 수
+const FRIEND_PER_IP = 1024; // IP 하나가 맡길 수 있는 수
+const FRIEND_TOTAL = 100000;
+const FRIEND_REQ_PER_MIN = 60; // IP 하나의 요청 수 (올리기 + 찾기)
+const FRIEND_MAX_BODY = 128 * 1024;
+const FRIEND_MSG = {
+  origin: '웹페이지에서는 친구 상태를 쓸 수 없어요',
+  'slow-down': '요청이 너무 많아요. 잠시 뒤에 다시 해 주세요',
+  'too-big': '요청이 너무 커요',
+  'bad-request': '요청 형식이 맞지 않아요',
+  full: '서버에 친구 상태가 너무 많아요',
+  method: '허용되지 않는 요청이에요',
+};
+function createFriendBoard({ now = Date.now } = {}) {
+  const board = new Map(); // id → { blob, ip, exp }
+  const perIp = new Map(); // ip → 맡긴 수
+  const reqs = new Map(); // ip → { n, reset }
+  const release = (id) => {
+    const e = board.get(id);
+    if (!e) return;
+    board.delete(id);
+    const c = (perIp.get(e.ip) || 1) - 1;
+    if (c > 0) perIp.set(e.ip, c);
+    else perIp.delete(e.ip);
+  };
+  function sweep() {
+    const t = now();
+    for (const [id, e] of board) if (e.exp <= t) release(id);
+    for (const [ip, r] of reqs) if (r.reset < t) reqs.delete(ip);
+  }
+  const timer = setInterval(sweep, 30e3);
+  timer.unref();
+
+  function handle(req, res, what) {
+    const send = (code, obj) => {
+      if (res.headersSent) return;
+      const body = JSON.stringify(obj);
+      res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+    };
+    const fail = (code, error) => {
+      send(code, { error, message: FRIEND_MSG[error] || error });
+      req.resume();
+    };
+    const origin = req.headers.origin;
+    if (origin && origin !== 'file://' && origin !== 'null') return fail(403, 'origin');
+    if (req.method !== 'POST') return fail(405, 'method');
+    const ip = req.socket.remoteAddress || '';
+    const t = now();
+    let r = reqs.get(ip);
+    if (!r || r.reset < t) reqs.set(ip, (r = { n: 0, reset: t + 60e3 }));
+    if (++r.n > FRIEND_REQ_PER_MIN) return fail(429, 'slow-down');
+    if (Number(req.headers['content-length']) > FRIEND_MAX_BODY) return fail(413, 'too-big');
+    const chunks = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (d) => {
+      if (over) return;
+      size += d.length;
+      if (size > FRIEND_MAX_BODY) {
+        over = true;
+        return fail(413, 'too-big');
+      }
+      chunks.push(d);
+    });
+    req.on('end', () => {
+      if (over) return;
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        return fail(400, 'bad-request');
+      }
+      if (!body || typeof body !== 'object') return fail(400, 'bad-request');
+      const okId = (id) => typeof id === 'string' && PRESENCE_ID.test(id);
+      const t2 = now();
+      if (what === 'get') {
+        const ids = body.ids;
+        if (!Array.isArray(ids) || ids.length > FRIEND_MAX_IDS || !ids.every(okId)) return fail(400, 'bad-request');
+        const found = {};
+        for (const id of ids) {
+          const e = board.get(id);
+          if (e && e.exp > t2) found[id] = e.blob;
+        }
+        return send(200, { found });
+      }
+      // put: { items: [{ id, blob }], drop: [id] }
+      const items = body.items === undefined ? [] : body.items;
+      const drop = body.drop === undefined ? [] : body.drop;
+      if (!Array.isArray(items) || !Array.isArray(drop) || items.length > FRIEND_MAX_ITEMS || drop.length > FRIEND_MAX_ITEMS) return fail(400, 'bad-request');
+      const good = (x) => x && okId(x.id) && typeof x.blob === 'string' && x.blob.length <= FRIEND_MAX_BLOB && /^[A-Za-z0-9_-]+$/.test(x.blob);
+      if (!items.every(good) || !drop.every(okId)) return fail(400, 'bad-request');
+      for (const id of drop) release(id);
+      const fresh = items.filter((x) => !board.has(x.id)).length;
+      const overIp = () => (perIp.get(ip) || 0) + fresh > FRIEND_PER_IP;
+      if (overIp() || board.size + fresh > FRIEND_TOTAL) sweep(); // 만료된 것부터 치우고 다시 봄
+      if (overIp()) return fail(429, 'slow-down');
+      if (board.size + fresh > FRIEND_TOTAL) return fail(503, 'full');
+      for (const x of items) {
+        release(x.id);
+        board.set(x.id, { blob: x.blob, ip, exp: t2 + FRIEND_TTL });
+        perIp.set(ip, (perIp.get(ip) || 0) + 1);
+      }
+      return send(200, { ok: true, ttl: FRIEND_TTL });
+    });
+  }
+  return { handle, size: () => board.size, close: () => clearInterval(timer) };
+}
+
 // 토큰 통: take(n) → 지금부터 기다려야 하는 ms (0 이면 바로)
 function bucket(rate, burst = rate) {
   let tokens = burst;
@@ -118,6 +237,7 @@ const safeEq = (a, b) => {
 function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 0, guestMbps = 0, maxGuests = 64, msgRate = 0, dataDir = 'data', signup = 'invite', now = Date.now } = {}) {
   const serverBucket = bucket(mbps(maxMbps));
   const accounts = createAccounts({ dataDir, signup, log, now });
+  const friends = createFriendBoard({ now });
   const traffic = { bytes: 0, paused: 0 }; // /status 용
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
   const connsPerIp = new Map();
@@ -137,6 +257,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
     guests: [...routes.values()].reduce((n, r) => n + r.guests.size, 0),
     connections: [...connsPerIp.values()].reduce((a, b) => a + b, 0),
     presence: presence.size,
+    friendStatus: friends.size(),
     bytes: traffic.bytes,
     pauses: traffic.paused,
     limits: { maxMbps: Number(maxMbps) || 0, jamMbps: Number(jamMbps) || 0, guestMbps: Number(guestMbps) || 0, maxGuests, msgRate: Number(msgRate) || 0 },
@@ -158,6 +279,8 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
     }
     // 브라우저 계정: 로그인 · 암호화된 보관함 동기화 (accounts.js)
     if (url === '/account' || url.startsWith('/account/')) return accounts.handle(req, res);
+    // 친구 상태: 무작위 ID 로 암호문 맡기기 · 찾기 (3분 지나면 사라짐)
+    if (url === '/friends/put' || url === '/friends/get') return friends.handle(req, res, url.slice(9));
     // 다른 기기에서 이어 보기: 무작위 ID 로 암호문 찾기 (없으면 404 — ID 가 있는지 없는지만 알 수 있고, 내용은 못 풂)
     const pm = /^\/presence\/([A-Za-z0-9_-]{43})$/.exec(url);
     if (pm) {
@@ -379,6 +502,7 @@ function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 20
 
   function close() {
     clearInterval(heartbeat);
+    friends.close();
     for (const route of [...routes.keys()]) closeRoute(route, 'relay stopping');
     for (const ws of wss.clients) ws.terminate();
     return new Promise((resolve) => server.close(() => resolve()));
