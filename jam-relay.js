@@ -39,8 +39,11 @@
  *     아이디: 앞뒤 공백 제거 + 소문자, /^[a-z0-9][a-z0-9._-]{2,31}$/ · auth: 32바이트의 base64
  *     vault: 앱이 암호화한 JSON 객체 (format: "jam-vault", kdf · dek · data 객체, 5MB 이하). 서버는 열지 않고 그대로 보관
  *   POST /account/prelogin  { id }                          → 200 { kdf }  (없는 아이디도 늘 같은 가짜 kdf → 아이디가 있는지 알 수 없음)
- *   POST /account/register  { id, auth, vault, invite? }    → 201 { token, rev: 1 } · 409 id-taken · 403 signup-closed / bad-invite
- *   POST /account/login     { id, auth }                    → 200 { token, rev, vault } · 401 bad-login (없는 아이디 · 틀린 auth 같은 응답)
+ *   POST /account/register  { id, auth, vault, invite? }    → 201 { token, rev: 1, server } · 409 id-taken · 403 signup-closed / bad-invite
+ *   POST /account/login     { id, auth }                    → 200 { token, rev, vault, server } · 401 bad-login (없는 아이디 · 틀린 auth 같은 응답)
+ *        server (1.3.0+): { key: 서버 신원 공개 키(Ed25519, base64url), lan: ["http://192.168.x.x:포트", …] } — 로그인한 앱에만
+ *   GET  /account/hello?nonce=<16~64자>                       → 200 { key, sig }  sig = 서버 키로 "jam-relay-hello|<nonce>" 에 서명
+ *        앱은 인터넷이 안 될 때 같은 네트워크 주소로 로그인하기 전에, 이걸로 처음 받아 둔 서버 키와 같은지 확인해요
  *   GET  /account/vault[?rev=N]   (Authorization: Bearer)   → 200 { rev, vault } · rev 가 같으면 304 · 401 bad-token
  *   PUT  /account/vault     { baseRev, vault }   (Bearer)   → 200 { rev } · baseRev 가 다르면 409 { error: 'conflict', rev, vault }
  *   POST /account/password  { auth, newAuth, baseRev, vault } (Bearer) → 200 { rev } · 다른 기기 토큰은 모두 끊김 · 401 bad-login · 409 conflict
@@ -236,7 +239,8 @@ const safeEq = (a, b) => {
 // dataDir · signup: 브라우저 계정 (accounts.js). now: (테스트용) 시계
 function createRelay({ port = 3031, host = '0.0.0.0', tls = null, maxRoutes = 200, log = () => {}, onFrame = null, maxMbps = 0, jamMbps = 0, guestMbps = 0, maxGuests = 64, msgRate = 0, dataDir = 'data', signup = 'invite', now = Date.now } = {}) {
   const serverBucket = bucket(mbps(maxMbps));
-  const accounts = createAccounts({ dataDir, signup, log, now });
+  // lanPort: 로그인한 앱에 알려 줄 같은 네트워크 주소의 포트 (요청을 받을 때는 server 가 이미 있음)
+  const accounts = createAccounts({ dataDir, signup, log, now, tls: !!tls, lanPort: () => server.address() && server.address().port });
   const friends = createFriendBoard({ now });
   const traffic = { bytes: 0, paused: 0 }; // /status 용
   const routes = new Map(); // route → { token, control, guests: Map(id → guest), closeTimer }
