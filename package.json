@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node jam-relay.js",
-    "test": "node test/relay.test.js && node test/accounts.test.js && node test/updater.test.js",
+    "test": "node test/relay.test.js && node test/accounts.test.js && node test/friends.test.js && node test/updater.test.js",
     "keygen": "node tools/keygen.js",
     "release": "node tools/make-release.js --publish"
   },
