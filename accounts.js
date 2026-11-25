@@ -111,7 +111,7 @@ function listInvites({ dataDir, now = Date.now() } = {}) {
 }
 
 // ---------- 계정 서버 ----------
-function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date.now } = {}) {
+function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date.now, lanPort = null, tls: tlsOn = false } = {}) {
   dataDir = path.resolve(dataDir || 'data');
   const policy = POLICIES.includes(signup) ? signup : 'invite';
   if (policy !== signup) log(`unknown signup policy "${signup}", using "invite"`);
@@ -130,6 +130,40 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
     writeAtomic(file, b);
     return (secret = b);
   }
+
+  // 서버 신원 키 (Ed25519, 1.3.0): 앱이 처음 로그인할 때 공개 키를 받아 두었다가, 인터넷이 안 될 때 같은 네트워크(LAN) 주소로
+  // 접속하기 전에 "진짜 그 서버인지" 서명으로 확인해요 (다른 와이파이의 같은 IP 에 로그인 값을 보내지 않게)
+  let idKey = null;
+  function serverIdentity() {
+    if (idKey) return idKey;
+    const file = path.join(dataDir, 'server-key.pem');
+    let priv = null;
+    try {
+      priv = crypto.createPrivateKey(fs.readFileSync(file, 'utf8'));
+    } catch {}
+    if (!priv || priv.asymmetricKeyType !== 'ed25519') {
+      priv = crypto.generateKeyPairSync('ed25519').privateKey;
+      writeAtomic(file, priv.export({ type: 'pkcs8', format: 'pem' }));
+    }
+    const pub = crypto.createPublicKey(priv).export({ type: 'spki', format: 'der' }).subarray(12).toString('base64url');
+    return (idKey = { priv, pub });
+  }
+  // 이 서버의 같은 네트워크 주소 (사설 IPv4 + 지금 포트) — 로그인한 앱에만 알려 줌
+  function lanAddresses() {
+    const port = typeof lanPort === 'function' ? lanPort() : null;
+    if (!port) return [];
+    const out = [];
+    for (const list of Object.values(require('os').networkInterfaces())) {
+      for (const a of list || []) {
+        if (a.family !== 'IPv4' && a.family !== 4) continue;
+        if (a.internal) continue;
+        if (!/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)) continue;
+        out.push(`${tlsOn ? 'https' : 'http'}://${a.address}:${port}`);
+      }
+    }
+    return out.slice(0, 4);
+  }
+  const serverInfo = () => ({ key: serverIdentity().pub, lan: lanAddresses() });
 
   // ---------- 계정 파일 (디스크가 원본, 메모리 캐시는 수정 시각 · 크기로 확인) ----------
   const cache = new Map(); // file → { mtimeMs, size, acc }
@@ -387,6 +421,7 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
       '/account/password': ['POST'],
       '/account/logout': ['POST'],
       '/account/delete': ['POST'],
+      '/account/hello': ['GET'],
     };
     if (!routes[route]) {
       discard(req);
@@ -442,6 +477,14 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
       return fail(429, 'locked', { message: `로그인 실패가 많아서 이 아이디는 ${min}분 동안 잠겼어요`, retryAfter: Math.ceil(ms / 1000) }, { 'Retry-After': String(Math.ceil(ms / 1000)) });
     };
 
+    // ---------- 0. hello: 서버 신원 확인 (앱이 보낸 무작위 값에 서버 키로 서명) ----------
+    if (route === '/account/hello') {
+      const nonce = url.searchParams.get('nonce') || '';
+      if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) return fail(400, 'bad-request');
+      const { priv, pub } = serverIdentity();
+      return send(200, { key: pub, sig: crypto.sign(null, Buffer.from(`jam-relay-hello|${nonce}`), priv).toString('base64url') });
+    }
+
     // ---------- 1. prelogin: 그 계정의 kdf (없는 아이디면 늘 같은 가짜) ----------
     if (route === '/account/prelogin') {
       const id = normId(body.id);
@@ -484,7 +527,7 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
       save({ id, rev: 1, verifier, vault: body.vault, createdAt: at, updatedAt: at });
       ipRegs.set(ip, [...recent(ipRegs, ip, REG_WINDOW), now()]);
       log(`account registered (${policy})`);
-      return send(201, { token: issueToken(id), rev: 1 });
+      return send(201, { token: issueToken(id), rev: 1, server: serverInfo() });
     }
 
     // ---------- 3. login ----------
@@ -504,7 +547,7 @@ function createAccounts({ dataDir, signup = 'invite', log = () => {}, now = Date
       }
       idFails.delete(id);
       const cur = load(id) || acc;
-      return send(200, { token: issueToken(id), rev: cur.rev, vault: cur.vault });
+      return send(200, { token: issueToken(id), rev: cur.rev, vault: cur.vault, server: serverInfo() });
     }
 
     // ---------- 여기부터는 로그인 토큰 필요 ----------

@@ -360,8 +360,30 @@ const bearer = (t) => ({ Authorization: `Bearer ${t}` });
   assert.equal(liI.body.rev, 1);
   assert.deepEqual((await call(E2.port, 'POST', '/account/prelogin', { id: 'not-ivy' })).body, fakeBefore);
   assert.equal(JSON.parse((await call(E2.port, 'GET', '/status')).raw).accounts, 1);
+  // 서버 신원 키 · 같은 네트워크 주소: 다시 켜도 같은 키
+  assert.equal(liI.body.server.key, regI.body.server.key);
+  assert.equal(liI.body.server.key.length, 43);
+  assert.ok(Array.isArray(liI.body.server.lan));
+  for (const u of liI.body.server.lan) assert.match(u, new RegExp(`^http://(10|192\\.168|172\\.(1[6-9]|2\\d|3[01]))\\.[\\d.]+:${E2.port}$`));
   await E2.close();
-  ok('다시 켜도 계정 · 보관함 · 가짜 kdf 는 그대로 (secret.bin), 로그인 토큰은 사라져서 다시 로그인');
+  ok('다시 켜도 계정 · 보관함 · 가짜 kdf · 서버 신원 키는 그대로, 로그인 토큰은 사라져서 다시 로그인 · 로그인 응답에 서버 키 · 같은 네트워크 주소');
+
+  // ================= hello: 서버 키 서명 (인터넷이 안 될 때 같은 네트워크 주소가 진짜 그 서버인지) =================
+  const E3 = await createRelay({ port: 0, host: '127.0.0.1', dataDir: dataE, signup: 'open' });
+  const nonce = crypto.randomBytes(24).toString('base64url');
+  const h = await call(E3.port, 'GET', `/account/hello?nonce=${nonce}`);
+  assert.equal(h.status, 200);
+  assert.equal(h.body.key, regI.body.server.key);
+  const pub = crypto.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(h.body.key, 'base64url')]), format: 'der', type: 'spki' });
+  assert.ok(crypto.verify(null, Buffer.from(`jam-relay-hello|${nonce}`), pub, Buffer.from(h.body.sig, 'base64url')));
+  assert.ok(!crypto.verify(null, Buffer.from('jam-relay-hello|other-nonce-xxxxxx'), pub, Buffer.from(h.body.sig, 'base64url')));
+  assert.equal((await call(E3.port, 'GET', '/account/hello?nonce=short')).status, 400);
+  assert.equal((await call(E3.port, 'GET', `/account/hello?nonce=${nonce}`, undefined, { Origin: 'https://evil.example' })).status, 403);
+  await E3.close();
+  const other = await createRelay({ port: 0, host: '127.0.0.1', dataDir: tmpData(), signup: 'open' });
+  assert.notEqual((await call(other.port, 'GET', `/account/hello?nonce=${nonce}`)).body.key, regI.body.server.key);
+  await other.close();
+  ok('hello: 보낸 무작위 값에 서버 키로 서명 · 다른 서버는 다른 키 · 짧은 값 400 · 웹페이지 403');
 
   for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
   console.log(`\n계정 테스트 통과 (${n}개)`);
